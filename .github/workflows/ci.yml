@@ -134,7 +134,7 @@ jobs:
 
       - name: Upload full PostgreSQL CI logs and coverage
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: postgres-ci-logs-and-coverage
           path: |
@@ -282,7 +282,7 @@ jobs:
 
       - name: Upload full Docker E2E logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docker-e2e-logs
           path: ci-logs/

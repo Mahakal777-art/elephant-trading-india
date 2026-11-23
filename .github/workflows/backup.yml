@@ -91,7 +91,7 @@ jobs:
 
       - name: Upload encrypted backup artifact
         if: steps.gate.outputs.ready == 'true' && success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: encrypted-postgres-backup
           path: |
@@ -117,7 +117,7 @@ jobs:
 
       - name: Upload backup logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backup-job-logs
           path: backup-logs/
@@ -195,7 +195,7 @@ jobs:
 
       - name: Upload restore logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backup-restore-logs
           path: restore-logs/
