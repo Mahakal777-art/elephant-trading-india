@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/*
+!data/.gitkeep
+private_uploads/*
+!private_uploads/.gitkeep
+token.json
+credentials.json
+coverage.xml
+*.dump
+*.dump.gpg
