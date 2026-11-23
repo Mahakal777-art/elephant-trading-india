@@ -1,0 +1,203 @@
+name: Encrypted Neon backup and restore test
+
+on:
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    outputs:
+      backup_ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - name: Check backup secrets
+        id: gate
+        shell: bash
+        env:
+          DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+        run: |
+          missing=()
+          [[ -n "$DATABASE_URL_DIRECT" ]] || missing+=("DATABASE_URL_DIRECT")
+          [[ -n "$BACKUP_ENCRYPTION_KEY" ]] || missing+=("BACKUP_ENCRYPTION_KEY")
+          if (( ${#missing[@]} )); then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "SKIPPED: encrypted backup requires ${missing[*]}; no database connection was attempted."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Backup prerequisites are present."
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL client repository
+        if: steps.gate.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p backup-logs
+          if sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg postgresql-client; then
+            echo "Base PostgreSQL client installed."
+          else
+            rc=$?
+            echo "install-client" > backup-logs/failing-step.txt
+            exit "$rc"
+          fi
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+
+      - name: Match pg_dump major version, dump and GPG encrypt via stdin
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p backup-logs
+          if {
+            PG_URL="$DATABASE_URL_DIRECT"
+            PG_URL="${PG_URL/postgresql+psycopg:\/\//postgresql:\/\/}"
+            PG_URL="${PG_URL/postgres:\/\//postgresql:\/\/}"
+            SERVER_VERSION=$(psql "$PG_URL" -Atc 'SHOW server_version_num')
+            SERVER_MAJOR=$((SERVER_VERSION / 10000))
+            echo "PostgreSQL server major=${SERVER_MAJOR}"
+            sudo apt-get install -y "postgresql-client-${SERVER_MAJOR}" gnupg
+            export PATH="/usr/lib/postgresql/${SERVER_MAJOR}/bin:$PATH"
+            pg_dump --version
+            CLIENT_MAJOR=$(pg_dump --version | sed -E 's/.* ([0-9]+)\..*/\1/')
+            echo "pg_dump client major=${CLIENT_MAJOR}"
+            test "$SERVER_MAJOR" = "$CLIENT_MAJOR"
+            printf '%s' "$SERVER_MAJOR" > server_major.txt
+            pg_dump --format=custom --no-owner "$PG_URL" > db.dump
+            printf '%s' "$BACKUP_ENCRYPTION_KEY" | gpg --batch --yes --pinentry-mode loopback --symmetric --cipher-algo AES256 --passphrase-fd 0 --output elephant-backup.dump.gpg db.dump
+            rm -f db.dump
+          } > backup-logs/backup.log 2>&1; then
+            cat backup-logs/backup.log
+          else
+            rc=$?
+            echo "backup" > backup-logs/failing-step.txt
+            tail -n 60 backup-logs/backup.log
+            exit "$rc"
+          fi
+
+      - name: Upload encrypted backup artifact
+        if: steps.gate.outputs.ready == 'true' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-postgres-backup
+          path: |
+            elephant-backup.dump.gpg
+            server_major.txt
+          retention-days: 30
+
+      - name: Write backup job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Backup job summary"
+            if [[ -f backup-logs/failing-step.txt ]]; then
+              echo "**Failed step:** $(cat backup-logs/failing-step.txt)"
+              tail -n 60 backup-logs/backup.log 2>/dev/null || true
+            elif [[ "${{ steps.gate.outputs.ready }}" != "true" ]]; then
+              echo "Backup skipped because required secrets are missing."
+            else
+              echo "Backup command completed or a GitHub-managed step failed; inspect full log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload backup logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-job-logs
+          path: backup-logs/
+          if-no-files-found: warn
+          retention-days: 30
+
+  restore-test:
+    needs: backup
+    if: needs.backup.outputs.backup_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download encrypted backup
+        uses: actions/download-artifact@v4
+        with:
+          name: encrypted-postgres-backup
+
+      - name: Start matching temporary PostgreSQL container
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p restore-logs
+          PG_MAJOR=$(cat server_major.txt)
+          echo "Starting isolated restore target postgres:${PG_MAJOR}"
+          docker run -d --name restore-pg -e POSTGRES_USER=restore -e POSTGRES_PASSWORD=restorepass -e POSTGRES_DB=restoredb -p 5432:5432 "postgres:${PG_MAJOR}" > restore-logs/container-id.log
+          for i in $(seq 1 40); do
+            if docker exec restore-pg pg_isready -U restore -d restoredb; then exit 0; fi
+            sleep 2
+          done
+          echo "restore-start" > restore-logs/failing-step.txt
+          docker logs restore-pg > restore-logs/postgres.log 2>&1 || true
+          tail -n 60 restore-logs/postgres.log
+          exit 1
+
+      - name: Decrypt via stdin, restore and run sanity queries
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p restore-logs
+          if {
+            sudo apt-get update
+            sudo apt-get install -y gnupg
+            printf '%s' "$BACKUP_ENCRYPTION_KEY" | gpg --batch --yes --pinentry-mode loopback --decrypt --passphrase-fd 0 --output db.dump elephant-backup.dump.gpg
+            docker cp db.dump restore-pg:/tmp/db.dump
+            docker exec restore-pg pg_restore --clean --if-exists --no-owner -U restore -d restoredb /tmp/db.dump
+            docker exec restore-pg psql -v ON_ERROR_STOP=1 -U restore -d restoredb -c "SELECT count(*) AS leads FROM leads; SELECT count(*) AS admins FROM admins; SELECT count(*) AS deals FROM deals; SELECT version_num FROM alembic_version;"
+          } > restore-logs/restore.log 2>&1; then
+            cat restore-logs/restore.log
+          else
+            rc=$?
+            echo "restore" > restore-logs/failing-step.txt
+            tail -n 60 restore-logs/restore.log
+            exit "$rc"
+          fi
+
+      - name: Stop temporary restore database
+        if: always()
+        run: docker rm -f restore-pg 2>/dev/null || true
+
+      - name: Write restore summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Backup restore summary"
+            if [[ -f restore-logs/failing-step.txt ]]; then
+              echo "**Failed step:** $(cat restore-logs/failing-step.txt)"
+              tail -n 60 restore-logs/restore.log 2>/dev/null || true
+            else
+              echo "Restore job completed or a GitHub-managed step failed; inspect full logs."
+              tail -n 25 restore-logs/restore.log 2>/dev/null || true
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload restore logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-restore-logs
+          path: restore-logs/
+          if-no-files-found: warn
+          retention-days: 30

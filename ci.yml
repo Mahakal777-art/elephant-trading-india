@@ -1,0 +1,290 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elephant-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres-tests:
+    name: PostgreSQL 16 tests, migrations and security checks
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: elephant
+          POSTGRES_PASSWORD: ci-test-password
+          POSTGRES_DB: elephant_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U elephant -d elephant_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      APP_ENV: test
+      SECRET_KEY: ci-only-secret-key-012345678901234567890123456789
+      COOKIE_SECURE: "false"
+      DATABASE_URL: postgresql+psycopg://elephant:ci-test-password@localhost:5432/elephant_test
+      DATABASE_URL_DIRECT: postgresql+psycopg://elephant:ci-test-password@localhost:5432/elephant_test
+      TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+      TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
+      UPLOADS_ENABLED: "false"
+      CUSTOMER_EMAILS_ENABLED: "false"
+      FOLLOWUPS_ENABLED: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install test and security tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ci-logs
+          if { python -m pip install --upgrade pip && python -m pip install -r requirements.txt bandit pip-audit; } > ci-logs/install.log 2>&1; then
+            cat ci-logs/install.log
+            echo "Dependency installation completed."
+          else
+            rc=$?
+            echo "install" > ci-logs/failing-step.txt
+            tail -n 60 ci-logs/install.log
+            python -m pip freeze > ci-logs/pip-freeze.txt || true
+            exit "$rc"
+          fi
+
+      - name: Ruff, Bandit, pip-audit, migrations and full pytest coverage
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ci-logs
+          run_logged() {
+            local name="$1"
+            shift
+            local logfile="ci-logs/${name}.log"
+            echo "Running: ${name}"
+            if "$@" >"$logfile" 2>&1; then
+              cat "$logfile"
+              echo "${name}: PASS"
+            else
+              local rc=$?
+              cat "$logfile"
+              printf '%s\n' "$name" > ci-logs/failing-step.txt
+              printf '%s\n' "$rc" > ci-logs/failing-exit-code.txt
+              return "$rc"
+            fi
+          }
+          run_logged ruff python -m ruff check app tests migrations scripts
+          run_logged bandit python -m bandit -q -r app scripts
+          run_logged pip-audit python -m pip_audit
+          run_logged alembic-up python -m alembic upgrade head
+          run_logged alembic-down python -m alembic downgrade 0001_initial
+          run_logged alembic-up-again python -m alembic upgrade head
+          run_logged pytest python -m pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=85 --tb=short -ra
+          if grep -Eiq '[0-9]+ skipped' ci-logs/pytest.log; then
+            echo "Unexpected skipped tests: PostgreSQL CI is required to run every database integration test." | tee ci-logs/pytest-skip-gate.log
+            echo "pytest-skip-gate" > ci-logs/failing-step.txt
+            exit 1
+          fi
+          grep -E '[0-9]+ passed|[0-9]+ failed|[0-9]+ skipped|coverage:' ci-logs/pytest.log > ci-logs/pytest-short-summary.txt || true
+
+      - name: Write PostgreSQL CI failure summary
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          {
+            echo "## PostgreSQL CI summary"
+            if [[ -f ci-logs/failing-step.txt ]]; then
+              failed="$(cat ci-logs/failing-step.txt)"
+              echo "**Failed step:** ${failed}"
+              echo "**Last 60 log lines:**"
+              if [[ -f "ci-logs/${failed}.log" ]]; then
+                tail -n 60 "ci-logs/${failed}.log"
+              elif [[ "${failed}" == "install" ]]; then
+                echo "Dependency installation failed before a dedicated log was captured."
+              else
+                echo "No per-step log found; inspect setup/checkout or GitHub-managed step logs."
+              fi
+            else
+              echo "No shell failure marker recorded. Inspect checkout/setup-python if the job failed before validation."
+            fi
+            if [[ -f ci-logs/pytest.log ]]; then
+              echo "### Pytest short summary"
+              if ! grep -E '[0-9]+ (passed|failed|skipped|error)|TOTAL|coverage:' ci-logs/pytest.log | tail -n 15; then
+                tail -n 30 ci-logs/pytest.log
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full PostgreSQL CI logs and coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-ci-logs-and-coverage
+          path: |
+            ci-logs/
+            coverage.xml
+          if-no-files-found: warn
+          retention-days: 30
+
+  docker-compose-e2e:
+    name: Docker build and full buyer/admin E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install smoke client
+        run: python -m pip install requests
+
+      - name: Prepare disposable E2E override
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          cat > compose.ci.override.yml <<'YAML'
+          services:
+            app:
+              environment:
+                SMOKE_CLEANUP_ENABLED: "true"
+          YAML
+
+      - name: Docker build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if docker compose -f compose.ci.yml -f compose.ci.override.yml build 2>&1 | tee ci-logs/docker-build.log; then
+            echo "Docker build completed."
+          else
+            rc=$?
+            echo "docker-build" > ci-logs/failing-step.txt
+            exit "$rc"
+          fi
+
+      - name: Start PostgreSQL and application containers
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if docker compose -f compose.ci.yml -f compose.ci.override.yml up -d 2>&1 | tee ci-logs/compose-up.log; then
+            echo "Compose stack started."
+          else
+            rc=$?
+            echo "compose-up" > ci-logs/failing-step.txt
+            exit "$rc"
+          fi
+
+      - name: Wait for app health and migrations
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8000/health > ci-logs/health.log 2>&1; then
+              cat ci-logs/health.log
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose -f compose.ci.yml -f compose.ci.override.yml logs > ci-logs/health-timeout-compose.log 2>&1 || true
+          echo "health" > ci-logs/failing-step.txt
+          tail -n 60 ci-logs/health-timeout-compose.log
+          exit 1
+
+      - name: Create disposable CI admin
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if docker compose -f compose.ci.yml -f compose.ci.override.yml exec -T app python -c "from app.db import SessionLocal; from app.models import Admin; from app.security import hash_password; s=SessionLocal(); s.add(Admin(username='ci-smoke-admin', password_hash=hash_password('CI-Smoke-Admin-Password-123!'))); s.commit(); s.close()" > ci-logs/create-admin.log 2>&1; then
+            cat ci-logs/create-admin.log
+          else
+            rc=$?
+            echo "create-admin" > ci-logs/failing-step.txt
+            tail -n 60 ci-logs/create-admin.log
+            exit "$rc"
+          fi
+
+      - name: Run buyer submit, DB/dashboard, duplicate, fail-closed, lockout and logout E2E
+        shell: bash
+        env:
+          SMOKE_BASE_URL: http://127.0.0.1:8000
+          SMOKE_ADMIN_USERNAME: ci-smoke-admin
+          SMOKE_ADMIN_PASSWORD: CI-Smoke-Admin-Password-123!
+        run: |
+          set -Eeuo pipefail
+          if python scripts/ci_smoke_test.py > ci-logs/e2e.log 2>&1; then
+            cat ci-logs/e2e.log
+          else
+            rc=$?
+            echo "e2e" > ci-logs/failing-step.txt
+            tail -n 60 ci-logs/e2e.log
+            exit "$rc"
+          fi
+
+      - name: Confirm smoke cleanup in PostgreSQL
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if docker compose -f compose.ci.yml -f compose.ci.override.yml exec -T postgres psql -U elephant -d elephant_test -v ON_ERROR_STOP=1 -c "SELECT count(*) AS remaining_smoke_rows FROM leads WHERE company='SMOKE-TEST' AND email LIKE 'smoke+%@invalid.test'; SELECT version_num FROM alembic_version;" > ci-logs/postgres-sanity.log 2>&1; then
+            cat ci-logs/postgres-sanity.log
+          else
+            rc=$?
+            echo "postgres-sanity" > ci-logs/failing-step.txt
+            tail -n 60 ci-logs/postgres-sanity.log
+            exit "$rc"
+          fi
+
+      - name: Collect compose logs and stop disposable stack
+        if: always()
+        shell: bash
+        run: |
+          docker compose -f compose.ci.yml -f compose.ci.override.yml logs > ci-logs/compose-all.log 2>&1 || true
+          docker compose -f compose.ci.yml -f compose.ci.override.yml down -v > ci-logs/compose-down.log 2>&1 || true
+
+      - name: Write Docker E2E failure summary
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p ci-logs
+          {
+            echo "## Docker E2E summary"
+            if [[ -f ci-logs/failing-step.txt ]]; then
+              failed="$(cat ci-logs/failing-step.txt)"
+              echo "**Failed step:** ${failed}"
+              echo "**Last 60 log lines:**"
+              if [[ -f "ci-logs/${failed}.log" ]]; then tail -n 60 "ci-logs/${failed}.log"; else echo "See full job log artifact and GitHub-managed step log."; fi
+            else
+              echo "No shell failure marker recorded. Inspect checkout/setup-python if failure occurred earlier."
+            fi
+            if [[ -f ci-logs/e2e.log ]]; then
+              echo "### E2E short summary"
+              tail -n 20 ci-logs/e2e.log
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full Docker E2E logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-e2e-logs
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 30

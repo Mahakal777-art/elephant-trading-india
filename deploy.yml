@@ -1,0 +1,128 @@
+name: Deploy Koyeb (manual, archive-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_paid_deploy:
+        description: "Set true only after reviewing the current Koyeb cost and approving the paid deployment."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elephant-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Guarded archive deploy
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check paid-deploy approval and required secrets
+        id: gate
+        shell: bash
+        env:
+          CONFIRM_PAID_DEPLOY: ${{ inputs.confirm_paid_deploy }}
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          KOYEB_APP: ${{ vars.KOYEB_APP }}
+          KOYEB_SERVICE: ${{ vars.KOYEB_SERVICE }}
+          DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+          DATABASE_URL_POOLED: ${{ secrets.DATABASE_URL_POOLED }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          TURNSTILE_SITE_KEY: ${{ secrets.TURNSTILE_SITE_KEY }}
+          TURNSTILE_SECRET_KEY: ${{ secrets.TURNSTILE_SECRET_KEY }}
+        run: |
+          missing=()
+          [[ "$CONFIRM_PAID_DEPLOY" == "true" ]] || missing+=("manual paid-deploy approval input is false")
+          [[ -n "$KOYEB_TOKEN" ]] || missing+=("KOYEB_TOKEN")
+          [[ -n "$KOYEB_APP" ]] || missing+=("KOYEB_APP repository variable")
+          [[ -n "$KOYEB_SERVICE" ]] || missing+=("KOYEB_SERVICE repository variable")
+          [[ -n "$DATABASE_URL_DIRECT" ]] || missing+=("DATABASE_URL_DIRECT")
+          [[ -n "$DATABASE_URL_POOLED" ]] || missing+=("DATABASE_URL_POOLED")
+          [[ -n "$SECRET_KEY" ]] || missing+=("SECRET_KEY")
+          [[ -n "$TURNSTILE_SITE_KEY" ]] || missing+=("TURNSTILE_SITE_KEY")
+          [[ -n "$TURNSTILE_SECRET_KEY" ]] || missing+=("TURNSTILE_SECRET_KEY")
+          if (( ${#missing[@]} )); then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "SKIPPED: Koyeb deploy not started. Missing/unchecked requirements: ${missing[*]}"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "All deploy preconditions and paid-deploy approval are present."
+          fi
+
+      - name: Checkout
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        if: steps.gate.outputs.ready == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install migration dependencies
+        if: steps.gate.outputs.ready == 'true'
+        run: python -m pip install -r requirements.txt
+
+      - name: Apply production migrations using DIRECT Neon URL
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+        run: python -m alembic upgrade head
+
+      - name: Install official Koyeb CLI
+        if: steps.gate.outputs.ready == 'true'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/koyeb/koyeb-cli/master/install.sh | sh
+          echo "$HOME/.koyeb/bin" >> "$GITHUB_PATH"
+
+      - name: Deploy archive using Dockerfile (never Git-connected)
+        if: steps.gate.outputs.ready == 'true'
+        env:
+          KOYEB_TOKEN: ${{ secrets.KOYEB_TOKEN }}
+          KOYEB_APP: ${{ vars.KOYEB_APP }}
+          KOYEB_SERVICE: ${{ vars.KOYEB_SERVICE }}
+          DATABASE_URL_POOLED: ${{ secrets.DATABASE_URL_POOLED }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          TURNSTILE_SITE_KEY: ${{ secrets.TURNSTILE_SITE_KEY }}
+          TURNSTILE_SECRET_KEY: ${{ secrets.TURNSTILE_SECRET_KEY }}
+          CRON_TOKEN: ${{ secrets.CRON_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          ADMIN_ALERT_EMAIL: ${{ secrets.ADMIN_ALERT_EMAIL }}
+          GRIEVANCE_EMAIL: ${{ secrets.GRIEVANCE_EMAIL }}
+          PRODUCTION_BASE_URL: ${{ vars.PRODUCTION_BASE_URL }}
+        run: |
+          set -euo pipefail
+          koyeb deploy . "$KOYEB_APP/$KOYEB_SERVICE" \
+            --token "$KOYEB_TOKEN" \
+            --archive-builder docker \
+            --archive-docker-dockerfile Dockerfile \
+            --ports 8000:http \
+            --routes /:8000 \
+            --env "APP_ENV=production" \
+            --env "PORT=8000" \
+            --env "COOKIE_SECURE=true" \
+            --env "TRUST_KOYEB_PROXY=true" \
+            --env "SMOKE_CLEANUP_ENABLED=false" \
+            --env "CUSTOMER_EMAILS_ENABLED=false" \
+            --env "FOLLOWUPS_ENABLED=false" \
+            --env "DATABASE_URL_POOLED=$DATABASE_URL_POOLED" \
+            --env "SECRET_KEY=$SECRET_KEY" \
+            --env "TURNSTILE_SITE_KEY=$TURNSTILE_SITE_KEY" \
+            --env "TURNSTILE_SECRET_KEY=$TURNSTILE_SECRET_KEY" \
+            --env "CRON_TOKEN=$CRON_TOKEN" \
+            --env "RESEND_API_KEY=$RESEND_API_KEY" \
+            --env "RESEND_FROM=$RESEND_FROM" \
+            --env "ADMIN_ALERT_EMAIL=$ADMIN_ALERT_EMAIL" \
+            --env "GRIEVANCE_EMAIL=$GRIEVANCE_EMAIL" \
+            --env "PRODUCTION_BASE_URL=$PRODUCTION_BASE_URL"
+
+      - name: Explain skipped deploy
+        if: steps.gate.outputs.ready != 'true'
+        run: echo "Deployment skipped safely. No migration or paid hosting action was run."

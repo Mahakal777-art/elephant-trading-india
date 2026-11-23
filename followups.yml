@@ -1,0 +1,20 @@
+name: Follow-ups (frozen - intentionally disabled)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  disabled:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain freeze
+        run: |
+          echo "SKIPPED: Customer follow-ups remain disabled."
+          echo "Do not enable until opt-out enforcement, signed unsubscribe, retry/backoff, consent and idempotency are implemented and reviewed."
+          {
+            echo "## Follow-up scheduler"
+            echo "**Status:** intentionally disabled; no customer email was sent."
+          } >> "$GITHUB_STEP_SUMMARY"
